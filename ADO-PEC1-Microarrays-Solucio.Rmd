@@ -1,0 +1,538 @@
+---
+title: "Análisis de Datos Ómicos. Primera PEC"
+author: "Alex Sánchez"
+date: "`r Sys.Date()`"
+output:
+  prettydoc::html_pretty:
+    
+    toc: true
+    toc_depth: 2
+    theme: architect
+    highlight: github
+editor_options: 
+  chunk_output_type: console
+bibliography: referencias.bib
+---
+
+```{r setup, echo=FALSE}
+library(knitr)
+library(rmdformats)
+
+## Global options
+options(max.print="75")
+opts_chunk$set(echo=TRUE,
+	             cache=TRUE,
+               prompt=FALSE,
+               tidy=TRUE,
+               comment=NA,
+               message=FALSE,
+               warning=FALSE)
+opts_knit$set(width=75)
+```
+
+# Introducción
+
+Esta PEC se basará en los datos de un estudio depositado en GEO con identificador "GSE46687" derivado de un estudio sobre identificación de genes que intervienen en la patogénesis del síndrome de Turner [ver @Wang2020]
+
+Utilizando los archivos .CEL descargados del sitio y una función ad-hoc que os proporcionaremos deberéis crear un subconjunto de muestras que será el que analizaréis.
+
+Deberéis:
+
+1.  Plantear las cuestiones que deseáis responder
+2.  Realizar los análisis necesarios y
+3.  Elaborar un informe explicando problemas, métodos, resultados y discusión.
+
+Recordad que *tan importante como el resultado es el razonamiento y el proceso que os leva a ello*, es decir el consultor debe poder ver no tan sólo donde habéis llegado sino también como y porque habéis llegado hasta allí.
+
+
+# Obtención y lectura de los datos
+## Los datos para el análisis
+
+Este estudio tiene 46 muestras en tres grupos por lo que trabajaremos con un subconjunto de las mismas.
+
+Los datos crudos pueden descargarse de GEO directamente accediendo a la dirección: <https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE46687> donde encontramos el enlace para la descarga, al final de la página:
+
+![](images/paste-12C30323.png)
+
+Descargamos los archivos comprimidos a un directorio "datos" que crearemos como subdirectorio de nuestro proyecto. Allí descomprimiremos dichos archivos hasta tener los archivos .CEL
+
+## La "plataforma" o tipo de microarray
+
+Para trabajar con microarrays, necesitamos conocer de que tgipo son, puesto que ello nos permite saber qué paquete de anotaciones necesitamos Esta información se encuentra también en la página de GEO correspondiente a los datos:
+
+![](images/paste-7A5C8F29.png)
+
+Esto nos indica que se trata de arrays de tipo 3'ITV en concreto el modelo HGU 133 plus 2 de Affymetrix, cuyas anotaciones se encuentran en el paquete `hgu133plus.db` de Bioconductor.
+
+
+## Selección de muestras y carga de los datos
+
+La lectura de datos se lleva a cabo utilizando las clases y métodos definidas en los paquetes `Biobase` y `oligo` de Bioconductor. Una forma cómoda de leer los datos y, al mismo tiempo, asignar a cada muestra los valores de las covariables (por ejemplo el grupo para el análisis) consiste en crear un pequeño archivo de texto, que suele denominarse `targets.csv` y que contiene la identificación de cada archivo con la asignación de cada muestra a cada condición experimental. En nuestro caso disponemos del archivo `targetsAll.csv` al que añadiremos los nombres de los archivos.
+
+```{r}
+listaArchivos <- list.files("datos")
+nombres<-substr(listaArchivos,1,10)
+targets0<- read.csv("targetsAll.csv", row.names =1 )
+if (sum(nombres==rownames(targets0)))
+  targets<- cbind(filenames=listaArchivos,targets0)
+```
+
+El contenido del archivo `targets` se utiliza en la lectura de los datos y la creación del objeto `rawData` las intensidades "crudas" de cada archivo .CEL. 
+
+### Creación de un subconjunto para el análisis
+
+Con el fin de que nuestro análisis contenga un número moderado de muestras podemos extraer aleatoriamente 6 muestras de cada grupo. Para ello utilizaremos la función `selectSample`para crear un nuevo objeto "targets" que tenga únicamente las filas seleccionadas.
+
+```{r}
+selectSamples<- function (myID){
+  set.seed(myID)
+  selected <- c(sample(1:10, 6),11, sample(12:26, 5), sample(27:36,6))
+  return(sort(selected))
+}
+```
+
+Escogiendo como argumento el número "1234567" se obtiene:
+
+```{r}
+mySelected <- selectSamples(1234567)
+selectedTargets <- targets[mySelected,]
+table(selectedTargets$karyotype)
+```
+
+## Lectura de los datos
+
+En primer lugar crearemos un objeto de tipo `annotatedDataFrame` que utilizaremos para leer los datos crudos.
+
+```{r, phenoData1}
+require(Biobase)
+sampleInfo <-AnnotatedDataFrame(selectedTargets) 
+show(pData(sampleInfo))
+```
+
+Dado que se trata de arrays algo antiguos, del tipo de los que aparecen en los materiales docentes podemos utilizar el paquete `affy` para leer los datos.
+
+```{r}
+library(affy)
+fileNames <- paste0("datos/",pData(sampleInfo)$filenames)
+rawData <- read.affybatch(filenames=fileNames,phenoData=sampleInfo)
+show(rawData)
+```
+
+Este objeto es la base para todos los análisis que se realizarán.
+
+# Preprocesado: Exploración, Control de Calidad y Normalización
+
+Los datos procedentes de la lectura de los microarrays se denominan datos crudos y deben ser pre-procesados de diversas formas antes de analizarlos.
+
+Pre- procesado es un término genérico que engloba varios procesos:
+- Exploración y control de calidad de los datos.
+- Normalización y resumen (llamdo sumarización) de los valores de las sondas de cada grupo de sondas.
+- Filtrado no especı́fico para eliminar el efecto de genes que no se expresano bien no se expresan de forma distinta entre los grupos.
+
+A su vez la exploración y el control de calidad contempla:
+- Exploraciones estadı́sticas estándar.
+- Técnicas de control de calidad desarrolladas especı́ficamente para datos de microarrays.
+
+## Exploración y visualización
+
+La exploración de los datos suele basarse en técnicas univariantes como los histogramas o los diagramas de caja o en técnicas multivariantes como los análisis de conglomerados (clusters), de distancias o de análisis de componentes principales.
+
+```{r, etiquetas}
+## ----preajustes
+colores <- c(rep("yellow", 6), rep("blue", 6), rep("red", 6))
+formas <-  c(rep(11, 6), rep(12, 6), rep(13, 6))
+grupos <- as.factor(pData(rawData)$karyotype)
+numSamples <- nrow(pData(rawData))
+sampleNames <-pData(rawData)$title
+colnames(exprs(rawData))<-sampleNames
+```
+
+
+```{r, explora1}
+## ----plotHist
+hist(rawData, main="Signal distribution", col=colores, lty=1:numSamples)
+legend (x="topright", legend=sampleNames , col=colores, lty=1:numSamples, cex=0.6)
+
+## ----boxplot
+boxplot(rawData, cex.axis=0.6, col=colores, las=2, names=sampleNames, 
+        main="Signal distribution for selected chips")
+```
+
+El histograma y el diagram de caja muestran que las distribuciones de los datos son similares en formas pero no en posición, lo que ya sugiere que será preciso algun tipo de centrado.
+
+```{r, plotPCA}
+## ----plotPCA
+library(ggplot2)
+library(ggrepel)
+plotPCA3 <- function (datos, labels, factor, title, scale,colores, size = 1.5, glineas = 0.25) {
+  data <- prcomp(t(datos),scale=scale)
+  # plot adjustments
+  dataDf <- data.frame(data$x)
+  Group <- factor
+  loads <- round(data$sdev^2/sum(data$sdev^2)*100,1)
+  # main plot
+  p1 <- ggplot(dataDf,aes(x=PC1, y=PC2)) +
+    theme_classic() +
+    geom_hline(yintercept = 0, color = "gray70") +
+    geom_vline(xintercept = 0, color = "gray70") +
+    geom_point(aes(color = Group), alpha = 0.55, size = 3) +
+    coord_cartesian(xlim = c(min(data$x[,1])-5,max(data$x[,1])+5)) +
+    scale_fill_discrete(name = "Group")
+  # avoiding labels superposition
+  p1 + geom_text_repel(aes(y = PC2 + 0.25, label = labels),segment.size = 0.25, size = size) + 
+    labs(x = c(paste("PC1",loads[1],"%")),y=c(paste("PC2",loads[2],"%"))) +  
+    ggtitle(paste("Principal Component Analysis for: ",title,sep=" "))+ 
+    theme(plot.title = element_text(hjust = 0.5)) +
+    scale_color_manual(values=colores)
+  }
+```
+
+
+```{r, explora2}
+## ----plotPCA2D
+plotPCA3(exprs(rawData), labels=sampleNames, size=2, factor =grupos, colores = c("red", "blue", "green"), title="selected samples", scale=TRUE)
+```
+
+La representación de los datos en las dos primeras componentes principales muestra que no hay una separación clara entre los grupos lo que nos lleva a pensar que puede algún tipo de _efecto batch_ que explique la diferencia. 
+
+Un cluster jerárquico refuerza esta impresión:
+
+```{r, explora3}
+clust.euclid.average <- hclust(dist(t(exprs(rawData))),method="average")
+plot(clust.euclid.average, labels=sampleNames, main="Hierarchical clustering of samples",  hang=-1)
+```
+
+La muestra `Xp_rep6` se separa de todas las demas. Una osibilidad es eliminarla del análisis.
+
+El paquete `arrayQualitMetrics` encapsula todos los análisis anteriores, y
+alguno más, facilitando su ejecución e incluso su interpretación. La instrucción
+`arrayQualityMetrics` lleva a cabo todos los análisis de una vez y genera un informe de resultados con ayudas a la interpretación y a la detección de arrays problemáticos.
+
+```{r, arrayQM, cache=TRUE, eval=FALSE}
+library(arrayQualityMetrics)
+arrayQualityMetrics(rawData, outdir = "arrayQuality",intgroup= "karyotype", force=TRUE)
+```
+
+Los resultados del control de calidad realizado con `arrayQualityMetrics` se encuentran accesibles a traves del archivo index.html contenido en el subdirectorio creado al invocarlo -en este caso denominado `arrayQuality`.
+
+
+## Análisis de efectos batch (1)
+
+Los análisis de componentes principales sugieren que puede haber algún factor que se superponga a las diferencias entre los grupos. Dado que no se dispone de información sobre otras covariables es difícil decidir si ésto es así.
+Una causa habitual del efectos batch es la fecha en que se procesan las muestras. 
+Una búsqueda en Google muestra que es posible obtener la fecha de hibridación de los archivos .CEL mediante la funcion `get.celfile.dates` del paquete `affyio`.
+
+```{r}
+library(affyio)
+HybDates<- as.factor(get.celfile.dates(fileNames))
+show(HybDates)
+pData(rawData) <- cbind(pData(rawData), HybDates)
+with(pData(rawData), table(HybDates, karyotype))
+```
+
+La tabla muestra que la hibridación se ha hecho de la peor manera posible confundiendo fecha y cariotipo para el grupo 46XX. Esto significa que, __si se encuentran diferencias entre este grupo y los demás no podremos estar seguros de si atribuirlo a la diferencia en expresión o a un efecto técnico__. Es lamentable pero absolutamente habitual en estudios con espresión génica.
+
+```{r explora2Bis}
+plotPCA3(exprs(rawData), labels=sampleNames, size=2, factor=HybDates, colores = c("red", "blue", "green", "grey", "black"), title="selected samples", scale=TRUE)
+```
+
+
+```{r, explora4}
+plot(clust.euclid.average, labels=HybDates, main="Hierarchical clustering of samples",  hang=-1)
+```
+
+Dado que no todos los cariotipos estan presentes en todos los lotes no es posible eliminar el efecto batch completamente. Una forma de hacerlo, al menos en parte, es incluir la fecha como factor en el modelo de análisis. 
+
+## Normalizacion y Filtraje
+
+Una vez realizado el control de calidad se procede a normalizar los datos y
+agregarlos. 
+
+La normalización puede hacerse por distintos métodos (MAS5, VSN, RMA,
+GCRMA, ...) pero en este caso se utilizará el método RMA que es sin duda el
+más utilizado entre arrays de affymetrix.
+
+El procesado mediante RMA implica un proceso en tres etapas:
+- Corrección de fondo (el RMA hace precisamente esto).
+- Normalización para hacer los valores de los arrays comparables.
+- Agregación ("Summarization") de las diversas sondas asociadas a cada grupo de sondas
+para dar un único valor.
+
+```{r, normalizacion}
+library(affy)
+eset_rma <- rma(rawData)    
+eset_rma
+```
+
+## Filtraje
+
+El filtraje no especı́fico permite eliminar los genes que varı́an poco entre
+condiciones o que deseamos quitar por otras razones como por ejemplo que no
+disponemos de anotación para ellos. La función `nsFilter` permite eliminar los
+genes que, o bien varı́an poco, o bien no se dispone de anotación para ellos.
+Si al filtrar deseamos usar las anotaciones, o la falta de ellas, como criterio
+de filtraje debemos disponer del correspondiente paquete de anotaciones.
+
+Si al crear el objeto `expressionSet` no se le ha asignado una anotación debe hacerse antes de filtrar pera evitar un error, que se prodicirá en el caso que intentemos filtrar con el parametro `require.entrez`puesto en TRUE. 
+
+En este caso no hay problema porque el procedimiento de lectura identifica el tipo de array y rellena automáticamente el campo `annotation`.
+
+```{r}
+annotation(eset_rma)
+```
+
+```{r, filtraje}
+library(genefilter)
+filtered <- nsFilter(eset_rma, require.entrez=TRUE,
+         remove.dupEntrez=TRUE, var.func=IQR,
+         var.cutoff=0.5, var.filter=TRUE,
+         filterByQuantile=TRUE, feature.exclude="^AFFX")
+
+names(filtered)
+class(filtered$eset)
+print(filtered$filter.log)
+eset_filtered <-filtered$eset
+```
+
+El resultado del filtraje es un objeto `expressionSet` que, en lugar de 54675 "features" tiene 10087 que son los que estan anotados y tienen mayor variabilidad. La selección de genes se llevará a cabo sobre esta lista.
+
+
+### Archivos de resultados normalizados
+
+El resultado de la normalización y el filtraje es un objeto expressionSet
+almacenado en un archivo binario datos.normaliados.Rda, que será la base
+para todos los estudios posteriores.
+
+```{r, saveData}
+save(eset_rma, eset_filtered, file=paste0("results/","datos.normalizados.Rda"))
+```
+
+# Selección de genes diferencialmente expresados
+
+Como en las etapas anteriores la selección de genes diferencialmente expresados (GDE) puede basarse en distintas aproximaciones, desde la t de Student
+al programa SAM pasando por multitud de variantes.
+En este ejemplo, dado que se realizaran tres comparaciones que luego deseamos comparar entre ellas, se aplicará la aproximación presentada por Smyth
+et al. (2004) basado en la utilización del modelo lineal general combinada con
+un método para obtener una estimación mejorada de la varianza.
+
+## Matrices de diseño y de contrastes
+
+El primer paso para el análisis basado en modelos lineales es crear la matriz
+de diseño. Básicamente se trata de una tabla que describe la asignación de cada muestra a un grupo. Tiene tantas filas como muestras y tantas columnas como grupos (si solo se considera un factor)Cada fila contiene un uno en la columna del grupo al que pertenece la muestra y un cero en las restantes.
+La matriz de contrastes esse utiliza para describir las comparaciones entre
+grupos. Consta de tantas columnas como comparaciones y tantas filas como
+grupos (es decir como columnas de la matriz de diseño). Una comparación entre
+grupos –llamada "contraste"– se representa con un "1" y un "-1" en las filas de los grupos a comparar y ceros en las restantes. Si varios grupos intervinieran en la comparación se tendrı́a tantos coeeficientes como grupos con la única restricción de que su suma serı́a cero.
+La matriz de diseño puede definirse manualmente o a partir de un factor
+creado especı́ficamente para ello.
+Manualmente, seria:
+
+```{r, matDesign1}
+design1<-matrix(
+            c(1,1,1,1,1,1, 0,0,0,0,0,0, 0,0,0,0,0,0,
+              0,0,0,0,0,0, 1,1,1,1,1,1, 0,0,0,0,0,0,
+              0,0,0,0,0,0, 0,0,0,0,0,0, 1,1,1,1,1,1),
+            nrow=18,byrow=F)
+colnames(design1)<-c("XX", "Xm", "Xp")
+rownames(design1) <-  sampleNames 
+print(design1)
+```
+
+La instrucción model matrix permite generar la matriz de diseño a partir de uno o más factores:
+
+```{r, matDesign1b}
+design1b <- model.matrix(~ 0+grupos)
+colnames(design1b)<-c("Xm", "Xp", "XX")
+rownames(design1b) <-  sampleNames 
+print(design1b)
+```
+
+
+Las comparaciones que nos interesan son las diferencias, dos a dos entre cada cariotipo lo que puede hacerse con los contrastes siguientes:
+
+```{r}
+library(limma)
+cont.matrix <- makeContrasts (
+      XvsM = Xm-XX,
+      XvsP = Xp-XX,
+      MvsP = Xp-Xm,
+      levels=design1)
+print(cont.matrix)
+```
+
+
+## Estimación del modelo y selección de genes
+
+Una vez definida la matriz de diseño y los contrastes podemos pasar a estimar el modelo, estimar los contrastes y realizar las pruebas de significación que nos indiquen, para cada gen y cada comparación, si puede considerarse diferencialmente expresado.
+
+El método implementado en limma amplı́a el análisis tradicional utilizando modelos de Bayes empı́ricos para combinar la información de toda la matriz de datos y de cada gen individual y obtener estimaciones de error mejoradas. 
+
+El análisis proporciona los estadı́sticos de test habituales como Fold-change t-moderados o p-valores ajustados que se utilizan para ordenar los genes de más a menos diferencialmente expresados.
+
+A fin de controlar el porcentaje de falsos positivos que puedan resultar del alto numero de contrastes realizados simultaneamente los p–valores se ajustan de forma que tengamos control sobre la tasa de falsos positivos utilizando el
+metodo de Benjamini y Hochberg.
+
+```{r, linearmodelfit}
+library(limma)
+fit<-lmFit(eset_filtered, design1)
+fit.main<-contrasts.fit(fit, cont.matrix)
+fit.main<-eBayes(fit.main)
+```
+
+La funcion `topTable` genera para cada contraste una lista de genes ordenados
+de mas a menos diferencialmente expresados.
+
+```{r, topTabs1}
+topTab_XvsM <- topTable (fit.main, number=nrow(fit.main), coef="XvsM", adjust="fdr"); head(topTab_XvsM)
+topTab_XvsP <- topTable (fit.main, number=nrow(fit.main), coef="XvsP", adjust="fdr"); head(topTab_XvsP)
+topTab_MvsP  <- topTable (fit.main, number=nrow(fit.main) , coef="MvsP", adjust="fdr"); head(topTab_MvsP)
+```
+
+Un volcano-plot es una figuras que permite visualizar si hay muchos o pocos genes con un gran fold-change y significativamente expresados o si este número
+es bajo. Estos gráficos representa en abscisas los cambios de expresión en escala logarı́tmica y en ordenadas el "menos logaritmo" del p-valor o alternativamente
+el estadı́stico B ("log-odds").
+
+```{r, volcano}
+library(annotate)
+probeNames <-rownames(fit.main)
+Symbols <- getSYMBOL(probeNames, annotation(eset_rma))
+myNames <- paste(probeNames, Symbols, sep=".")
+head(myNames)
+volcanoplot(fit.main, coef="XvsM", highlight=10, names=Symbols)
+```
+
+
+## Comparaciones múltiples
+
+Cuando se realizan varias comparaciones a la vez puede resultar importante ver que genes cambian simultáneamente en más de una comparación.
+
+Si el número de comparaciones es alto también puede ser necesario realizar un ajuste de p-valores entre las comparaciones, distinto del realizado entre genes.
+
+La función `decidetests` permite realizar ambas cosas.
+En este ejemplo no se ajustaran los p-valores entre comparaciones. Tan solo se seleccionaran los genes que cambian en una o más condiciones.
+
+EL resultado del análisis es una tabla `res` que para cada gen y cada comparación  contiene un 1 (si el gen esta sobre-expresado o ``up'' en esta condicion), un 0 (si no hay cambio significativo) o un -1  (si esta ``down''-regulado).
+
+```{r decideTests}
+res<-decideTests(fit.main, method="separate", adjust.method="fdr", p.value=0.05, lfc=0)
+```
+
+Para resumir dicho análisis podemos contar qué filas tienen como mínimo una celda distinta de cero:
+
+```{r resumeDecideTests, eval=TRUE}
+sum.res.rows<-apply(abs(res),1,sum)
+res.selected<-res[sum.res.rows!=0,] 
+print(summary(res))
+```
+
+Un diagrama de Venn permite visualizar la tabla anterior sin diferenciar entre genes ``up'' o ``down'' regulados.
+
+```{r,   fig.cap="Número de genes seleccionado en cada comparacion"}
+vennDiagram (res.selected[,1:3], main="Genes in common #1", cex=0.9)
+```
+
+## Resultados
+
+El resultado es bastante claro y coincide con lo que habíamos visto en el análisis exploratorio:
+
+- La diferencia más clara está entre los grupos XX y Xm
+- XX y XP estan poco separados
+- No se detectan diferencias entre XM y XP
+
+Este resultado, sin embargo, tiene que quedar, en el mejor de los casos en entredicho puesto que, como se ha visto, las diferencias entre estos grupos coinciden con las que podríamos atribuir a los efectos batch.
+
+Una alternativa que llevaríamos a cabo en una situación real sería repetir los análisis dentro de alguno de los lotes, por ejemplo las muestras hibridadas en 2008 y ver si coinciden con los anteriores, De ser así se confirmarían estos resultados pero la duda quedaría pendiente sobre las comparaciones en las que ésto no es posible.
+
+## Visualización de los perfiles de expresión
+
+Tras seleccionar los genes diferencialmente expresados podemos visualizar 
+las expresiones de cada gen agrupándolas para destacar los genes que se 
+encuentran up o down regulados simultáneamente constituyendo _perfiles de expresión_.
+
+Hay distintas formas de visualización pero aquí tan sólo se presenta el uso de mapas de color o "Heatmaps".
+
+En primer lugar seleccionamos los genes a visualizar: Se toman todos aquellos que 
+han resultado diferencialmente expresados en alguna de las tres comparaciones.
+
+```{r, prepareData}
+probeNames<-rownames(res)
+probeNames.selected<-probeNames[sum.res.rows!=0]
+exprs2cluster <-exprs(eset_filtered)[probeNames.selected,]
+colnames(exprs2cluster)<-sampleNames
+color.map <- function(grupo) { 
+  if (grupo=="46XX"){
+    c<- "yellow" 
+  }else{ 
+    if (grupo=="45Xm"){
+      c<- "red"
+    }else{
+      c<- "blue"
+   }
+  }
+return(c)}
+```
+
+Para representar el Heatmap tan sólo necesitamos la matriz de datos resultante.
+
+```{r, plotHeatMap1, fig.cap="Mapa de colores basado en los genes seleccionados por estar diferencialmente expresados. Como puede verse los tumores Apocrinos y Luminales tienen perfiles de expresión más parecidos entre ellos que cada uno con los de tipo Basal"}
+grupColors <- unlist(lapply(pData(eset_filtered)$karyotype, color.map))
+heatmap(exprs2cluster, col=rainbow(100), ColSideColors=grupColors, cexCol=0.9)
+```
+
+El gráfico muestra claramente que hay grupos de genes que varían entre los grupos XX y los otros dos que se diferencian mucho menos.
+
+# Análisis de significación biológica
+
+Una vez obtenidas las listas de genes diferencialmente expresados pueden llevarse a cabo todo tipo de análisis sobre ellas, generalmente encaminados a facilitar la interpretación de los resultados.
+
+Entre estas exploraciones –que podemos llamar genericamente"post-procesado de las listas" se encuentra la anotación de las listas de genes en diversas bases de datos.
+
+EL análisis de significación biológica de las listas mediante análisis de enriquecimiento o mediante "gene set analysis" para detectar si las listas se
+encuentran enriquecidas en genes asociados a funciones o procesos biológicos determinados.
+
+En vista de que las comparaciones entre los grupos XX-Xp y XM-Xp dan pocos o ningún gen seleccionados y, además, pueden estar influídos por el efecto batch tan sólo se realizará el análisis de significación para la primera comparación.
+
+Puesto que el número de genes que podemos considerar diferencialmente expresados es suficientemente alto se realizará un análisis de sobre-representación o _Gene Enricment Analysis_.
+
+Se han desarrollad multitud de variantes de estos tipos de análisis (@Khatri:2005) pero aquí utilizaremos el análisis básico de enriquecimiento tal como se describe en los trabajos de Gentleman (@Gentleman:2004) implementados en el paquete `GOstats` de Bioconductor.
+
+El análisis se realiza sobre dos bases de datos de anotaciones, la "Gene Ontology'' o la ``Kyoto Encyclopedia of Genes and Genomes''.
+
+Los análisis de este tipo necesitan un número mínimo de genes para resultar fiables por lo que se incluiran en todos los genes con p--valores ajustados inferiores a 0.05 (sin filtrar por minimo ``fold--change'').
+
+```{r, ORA}
+library(GOstats)
+# Seleccionamos la "topTable"
+topTab <- topTab_XvsM
+# Definimos el universo de genes: todos los que se han incluido en el análisis
+# EL programa trabaja con identificadores "entrez" y no admite duplicados
+entrezUniverse = unique(getEG(rownames(topTab), "hgu133plus2.db"))
+  
+# Escogemos los grupos de sondas a incluir en el análisis
+# Este análisis trabaja bien con varios centenares de genes 
+# por lo que es habitual basarse en p-valores sin ajustar para incluirlos
+
+whichGenes<-topTab["adj.P.Val"]<0.05
+geneIds <-   unique(getEG(rownames(topTab)[whichGenes],"hgu133plus2.db"))
+  
+# Creamos los "hiperparámetros" en que se basa el análisis
+GOparams = new("GOHyperGParams",
+    geneIds=geneIds, universeGeneIds=entrezUniverse,
+    annotation="org.Hs.eg.db", ontology="BP",
+    pvalueCutoff=0.001, conditional=FALSE,
+    testDirection="over")
+
+# Ejecutamos los análisis
+
+GOhyper = hyperGTest(GOparams)
+
+# Creamos un informe html con los resultados
+comparison <-"XXvsXM"
+GOfilename <- paste0("GOResults.", comparison,".html")
+htmlReport(GOhyper, file = GOfilename, summary.args=list("htmlLinks"=TRUE))
+```
+
+# Discusión y conclusiones
+
+#  Referencias
+

@@ -1,0 +1,156 @@
+---
+title: "Análisis de Datos Ómicos. Primera PEC"
+author: "Alex Sánchez"
+date: "`r Sys.Date()`"
+output:
+  prettydoc::html_pretty:
+ 
+    toc: true
+    toc_depth: 2
+    theme: architect
+    highlight: github
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, echo=FALSE}
+library(knitr)
+library(rmdformats)
+
+## Global options
+options(max.print="75")
+opts_chunk$set(echo=TRUE,
+               prompt=FALSE,
+               tidy=TRUE,
+               comment=NA,
+               message=FALSE,
+               warning=FALSE)
+opts_knit$set(width=75)
+```
+
+# Introducción
+
+Este ejercicio realiza un análisis de microarrays con tres grupos.
+
+Con el fin de evitar tener que trabajar con un excesivo número de muestras y, a la vez, personalizar el análisis y los resultados, se utilizará un *dataset* con múltiples grupos en el que se sortearan las muestras.
+
+# PARTE 1 (solo para los profesores)
+
+Disponemos de dos estudios candidaros que vamos a explorar antes de decidir cual será objeto de la práctica.
+
+## Dataset 1: Estudio sobre inflamación intestinal
+
+## Lectura de los datos
+
+```{r expressionFromGSE78523, eval=FALSE}
+if (!require(GEOquery)) {
+  BiocManager::install("GEOquery")
+}
+library(GEOquery)
+gse <- getGEO("GSE78523")
+class(gse)
+names(gse)
+gse[[1]]
+esetFromGEO1 <- gse[[1]]
+targetsAll <- pData(esetFromGEO1)
+targets1<- targetsAll[,c("title", "age:ch1", "localization:ch1", "Sex:ch1", "status:ch1","tissue:ch1")]
+colnames(targets1)<- c("title", "age", "localization", "Sex", "status","tissue")
+pData(esetFromGEO1)<- targets1
+save(esetFromGEO1, file="data/esetFromGSE78523.Rda")
+```
+
+## Chequeo de los datos
+
+```{r}
+library(Biobase)
+if(!exists("esetFromGEO1")) load(file="data/esetFromGSE78523.Rda")
+table(pData(esetFromGEO1)$status)
+library(arrayQualityMetrics)
+# arrayQualityMetrics(esetFromGEO1, 
+#                    force=TRUE, 
+#                    intgroup="status")
+```
+
+# Dataset 2: Estudio sobre el síndrome de Turner
+
+## Lectura de los datos
+
+```{r expressionFromGSE46687}
+library(GEOquery)
+gse <- getGEO("GSE46687")
+class(gse)
+names(gse)
+gse[[1]]
+esetFromGEO2 <- gse[[1]]
+targetsAll <- pData(esetFromGEO2)
+library(stringr)
+targets2<- targetsAll[,c("title", "karyotype:ch1")]
+colnames(targets2)<- c("title", "karyotype")
+s<-targets2$title 
+ss<- str_split(s, " ")
+targets2$title <- unlist(lapply(ss, function(x) paste(substr(x[1],3,4), x[3], sep="_")))
+pData(esetFromGEO2)<- targets2
+save(esetFromGEO2, file="data/esetFromGSE46687.Rda")
+```
+
+## Chequeo de los datos
+
+```{r}
+if(!exists("esetFromGEO2")) 
+  load(file="data/esetFromGSE46687.Rda")
+targets <- pData(esetFromGEO2)
+write.csv(targets, file="targetsAll.csv")
+targetsAll <- read.csv(file="targetsAll.csv", row.names = 1, head=TRUE)
+table(targetsAll$karyotype)
+require(arrayQualityMetrics)
+# arrayQualityMetrics(esetFromGEO2, 
+#                    force=TRUE, 
+#                    intgroup="karyotype")
+```
+
+# Análisis de datos con el dataset seleccionado
+
+Una vez exploradas las dos opciones nos decantamos por el conjunto de datos del estudio GSE46687. Este estudio tiene 46 muestras en tres grupos por lo que trabajaremos con un subconjunto de las mismas. La siguiente función permite seleccionar un subconjunto aleatorio de 18 observaciones que contiene una muestra "problemática" (la número 11, que siempre se incluye).
+
+## Creación de un subconjunto para el análisis
+
+Con el fin de que nuestro análisis contenga un número moderado de muestras podemos extraer aleatoriamente 6 muestras de cada grupo. Lo haremos con esta función:
+
+```{r}
+selectSamples<- function (myID){
+  set.seed(myID)
+  selected <- c(sample(1:10, 6),11, sample(12:26, 5), sample(27:36,6))
+  return(sort(selected))
+}
+selectSamples(1234567)
+selectSamples(9999999)
+mySelected <- selectSamples(1234567)
+
+targetsAll <- read.csv(file="targetsAll.csv", row.names = 1, head=TRUE)
+(myTargets <- targetsAll[mySelected,])
+table(myTargets$karyotype)
+```
+
+Una vez escogidas las muestras subseteamos el objeto expressionSet.
+
+```{r}
+load("data/esetFromGSE46687.Rda")
+myEset <- esetFromGEO2[,mySelected]
+myEsetClean <- myEset[,-7]
+# arrayQualityMetrics(myEset, intgroup = "karyotype")
+# arrayQualityMetrics(myEsetClean, intgroup = "karyotype")
+```
+
+### Filtraje de los datos
+
+```{r}
+require(genefilter)
+annotation(myEset) <- "hgu133plus2"
+filtered <- nsFilter(myEset, require.entrez=TRUE,  
+                     remove.dupEntrez=TRUE,
+                     var.func=IQR,
+                     var.cutoff=0.5,
+                     var.filter=TRUE,
+                     filterByQuantile=TRUE,
+                     feature.exclude="^AFFX")
+```
